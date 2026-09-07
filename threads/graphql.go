@@ -4,17 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"maps"
 	"net/http"
 	"net/url"
 	"strings"
 )
 
-// The logged-out GraphQL path. Threads marks a caller as a crawler through a set
-// of relay provider flags; with those set, the persisted profile-threads, post,
-// and search queries return data without a session. doc_id values rotate (see
-// config.go), so a stale id degrades to "no extra data" rather than an error.
+// The GraphQL path. Threads marks a caller as a crawler through a set of
+// relay provider flags; with those set, the persisted profile-threads, post,
+// and search queries return data without a session. doc_id values rotate
+// (see config.go), so a stale id used to degrade to "no extra data" - Threads
+// has since tightened this so a variable set the current doc_id doesn't
+// recognize gets a flat {"errors":[...]} instead, which graphqlPost treats as
+// an error rather than "no more results" (see the env.Data handling below).
 
+// relayProviderVars is the minimal, anonymous-crawler flag set: enough for
+// the SSR-adjacent logged-out queries this client was originally built
+// around. It is deliberately NOT merged into a captured template's variables
+// (see graphqlProfileThreads) - the template already carries a real session's
+// full flag set, and overwriting it with these anonymous defaults would just
+// reintroduce the "execution error" failure mode captureTemplate exists to
+// avoid.
 func relayProviderVars() map[string]any {
 	return map[string]any{
 		"__relay_internal__pv__BarcelonaIsLoggedInrelayprovider":             false,
@@ -25,29 +34,60 @@ func relayProviderVars() map[string]any {
 	}
 }
 
-// maxGraphQLPages caps how far the logged-out pagination walks, so an unbounded
-// crawl cannot loop forever on a profile with a very long history.
-const maxGraphQLPages = 20
+// maxGraphQLPages caps how far pagination walks, so an unbounded crawl cannot
+// loop forever if Threads' has_next_page ever gets stuck true. A real full
+// history backfill (a ~2 year old, active account) has been observed to take
+// ~110 pages at 10 posts/page; 500 leaves ample headroom.
+const maxGraphQLPages = 500
 
-// graphqlProfileThreads walks a user's posts via the logged-out persisted query,
-// following the page_info cursor from startCursor until it runs out or the page
-// cap is hit. startCursor is the end_cursor from the server-rendered window, so
-// pagination resumes where the SSR page left off.
+// graphqlProfileThreads walks a user's posts via the persisted profile-threads
+// query, following the page_info cursor from startCursor until it runs out or
+// the page cap is hit. startCursor is the end_cursor from the server-rendered
+// window, so pagination resumes where the SSR page left off.
+//
+// When c.cfg.CaptureFile is set (see graphql_capture.go), every request
+// reuses the exact doc_id and full relay variable set a real logged-in
+// browser session sent - only "after" and "userID" are overridden per page.
+// This is what actually unlocks a full history: Threads visibly caps
+// anonymous/under-authenticated profile pagination at roughly 20 posts
+// regardless of doc_id freshness, but a real session's variable set does not
+// hit that ceiling. Without a capture file, this falls back to
+// DocIDProfileThreads and the minimal anonymous variable set - subject to
+// both that ceiling and to doc_id going stale until the constant is updated.
 func (c *Client) graphqlProfileThreads(ctx context.Context, userID, startCursor string) ([]Post, error) {
+	tpl := c.captureTemplate()
+
 	var out []Post
 	cursor := startCursor
 	for page := 0; page < maxGraphQLPages; page++ {
-		vars := map[string]any{"userID": userID}
+		docID := DocIDProfileThreads
+		var vars map[string]any
+		if tpl != nil {
+			docID = tpl.docID
+			vars = cloneVars(tpl.variables)
+		} else {
+			vars = relayProviderVars()
+		}
+		vars["userID"] = userID
 		if cursor != "" {
 			vars["after"] = cursor
+		} else {
+			vars["after"] = nil
 		}
-		raw, err := c.graphqlPost(ctx, DocIDProfileThreads, vars)
+
+		raw, err := c.graphqlPost(ctx, docID, vars)
 		if err != nil {
 			return out, err
 		}
-		out = append(out, postsFromGraphQL(raw)...)
+		posts := postsFromGraphQL(raw)
+		out = append(out, posts...)
 		next, more, ok := findPageInfo(raw, 0)
 		if !ok || !more || next == "" || next == cursor {
+			break
+		}
+		if len(posts) == 0 {
+			// Cursor advanced but nothing came back with it - stop rather
+			// than spin for maxGraphQLPages requests on a dead end.
 			break
 		}
 		cursor = next
@@ -55,10 +95,21 @@ func (c *Client) graphqlProfileThreads(ctx context.Context, userID, startCursor 
 	return out, nil
 }
 
-// graphqlPostReplies fetches a window of a post's replies via the logged-out
-// persisted query.
+// cloneVars shallow-copies a variables map so per-page overrides (after,
+// userID) never mutate the cached template between pages or requests.
+func cloneVars(src map[string]any) map[string]any {
+	out := make(map[string]any, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+// graphqlPostReplies fetches a window of a post's replies via the persisted
+// query.
 func (c *Client) graphqlPostReplies(ctx context.Context, postID string) ([]Post, error) {
-	vars := map[string]any{"postID": postID}
+	vars := relayProviderVars()
+	vars["postID"] = postID
 	raw, err := c.graphqlPost(ctx, DocIDPostPage, vars)
 	if err != nil {
 		return nil, err
@@ -66,9 +117,10 @@ func (c *Client) graphqlPostReplies(ctx context.Context, postID string) ([]Post,
 	return postsFromGraphQL(raw), nil
 }
 
-// graphqlSearch runs the logged-out keyword search query.
+// graphqlSearch runs the keyword search persisted query.
 func (c *Client) graphqlSearch(ctx context.Context, query string) ([]Post, error) {
-	vars := map[string]any{"query": query}
+	vars := relayProviderVars()
+	vars["query"] = query
 	raw, err := c.graphqlPost(ctx, DocIDSearch, vars)
 	if err != nil {
 		return nil, err
@@ -76,9 +128,12 @@ func (c *Client) graphqlSearch(ctx context.Context, query string) ([]Post, error
 	return postsFromGraphQL(raw), nil
 }
 
-// graphqlPost POSTs a persisted query and returns the decoded data tree.
+// graphqlPost POSTs a persisted query and returns the decoded data tree. A
+// response with no "data" field - Threads' shape for a doc_id that rejected
+// the variable set outright, as well as for a genuinely malformed request -
+// surfaces as the same "unexpected shape" CodeError either way; callers don't
+// need to tell the two apart, both mean "stop and refresh the capture file."
 func (c *Client) graphqlPost(ctx context.Context, docID string, vars map[string]any) (any, error) {
-	maps.Copy(vars, relayProviderVars())
 	varsJSON, _ := json.Marshal(vars)
 	form := url.Values{}
 	form.Set("lsd", "t")
@@ -113,8 +168,8 @@ func (c *Client) graphqlPost(ctx context.Context, docID string, vars map[string]
 	var env struct {
 		Data json.RawMessage `json:"data"`
 	}
-	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, codeErr(ExitNotFound, "graphql returned an unexpected shape (doc_id may be stale)")
+	if err := json.Unmarshal(body, &env); err != nil || len(env.Data) == 0 {
+		return nil, codeErr(ExitNotFound, "graphql returned no data (doc_id may be stale - see THREADS_CAPTURE_FILE)")
 	}
 	var data any
 	if err := json.Unmarshal(env.Data, &data); err != nil {

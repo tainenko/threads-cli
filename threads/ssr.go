@@ -274,9 +274,16 @@ func parsePost(data map[string]any) Post {
 			p.IsQuotePost = q
 		}
 		if rt := tpi["reply_to_author"]; rt != nil {
-			p.IsReply = true
 			if author, ok := rt.(map[string]any); ok {
 				p.ReplyToID = asString(author["pk"])
+			}
+			// A post replying to its own earlier post is a self-thread
+			// continuation (accounts that write in numbered 1/2/3 parts do
+			// this constantly) - it's still the author's own content, not a
+			// reply to someone else. Only the latter should be excluded from
+			// a profile's own post listing.
+			if p.ReplyToID != "" && p.ReplyToID != p.UserID {
+				p.IsReply = true
 			}
 		}
 	}

@@ -28,6 +28,8 @@ type Client struct {
 	cache   *Cache
 	mu      sync.Mutex
 	lastReq time.Time
+
+	captureState
 }
 
 // NewClient builds a Client from cfg, resolving the proxy.

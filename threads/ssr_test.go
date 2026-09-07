@@ -21,6 +21,9 @@ const fixtureHTML = `<html><head>
       "text_post_app_info":{"direct_reply_count":2,"repost_count":1,"quote_count":0,"reply_to_author":null}}},
     {"post":{"pk":"101","code":"DEF","caption":{"text":"a reply"},"taken_at":1700000100,
       "like_count":3,"media_type":19,"user":{"pk":"99","username":"babbage"},
+      "text_post_app_info":{"direct_reply_count":0,"reply_to_author":{"pk":"42","username":"ada"}}}},
+    {"post":{"pk":"102","code":"GHI","caption":{"text":"2/2 continuing my own thread"},"taken_at":1700000200,
+      "like_count":5,"media_type":19,"user":{"pk":"42","username":"ada"},
       "text_post_app_info":{"direct_reply_count":0,"reply_to_author":{"pk":"42","username":"ada"}}}}
   ],
   "page_info":{"end_cursor":"CURSOR1","has_next_page":true}}}}}]]]}
@@ -59,8 +62,8 @@ func TestParseProfileSSRWallIsNotFound(t *testing.T) {
 
 func TestParsePostsSSRReplyDetection(t *testing.T) {
 	posts := parsePostsSSR(fixtureHTML)
-	if len(posts) != 2 {
-		t.Fatalf("want 2 posts, got %d", len(posts))
+	if len(posts) != 3 {
+		t.Fatalf("want 3 posts, got %d", len(posts))
 	}
 	byID := map[string]Post{}
 	for _, p := range posts {
@@ -88,6 +91,18 @@ func TestParsePostsSSRReplyDetection(t *testing.T) {
 	}
 	if reply.ReplyToID != "42" {
 		t.Errorf("reply 101 reply_to_id: %q", reply.ReplyToID)
+	}
+
+	selfThread, ok := byID["102"]
+	if !ok {
+		t.Fatal("missing self-thread continuation 102")
+	}
+	if selfThread.IsReply {
+		t.Error("post 102 replies to its own author (pk 42) and must not count as a reply - " +
+			"accounts that write numbered 1/2/3 threads do this for every part after the first")
+	}
+	if selfThread.ReplyToID != "42" {
+		t.Errorf("post 102 reply_to_id should still be recorded even though it's not a reply: %q", selfThread.ReplyToID)
 	}
 }
 

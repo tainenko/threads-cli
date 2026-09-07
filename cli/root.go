@@ -30,24 +30,25 @@ type App struct {
 
 // globalFlags holds the persistent flag values before they fold into Cfg.
 type globalFlags struct {
-	output    string
-	fields    string
-	noHeader  bool
-	template  string
-	limit     int
-	rate      time.Duration
-	retries   int
-	timeout   time.Duration
-	noCache   bool
-	cacheTTL  time.Duration
-	lang      string
-	quiet     bool
-	verbose   int
-	proxy     string
-	userAgent string
-	token     string
-	session   string
-	csrf      string
+	output      string
+	fields      string
+	noHeader    bool
+	template    string
+	limit       int
+	rate        time.Duration
+	retries     int
+	timeout     time.Duration
+	noCache     bool
+	cacheTTL    time.Duration
+	lang        string
+	quiet       bool
+	verbose     int
+	proxy       string
+	userAgent   string
+	token       string
+	session     string
+	csrf        string
+	captureFile string
 }
 
 // Root builds the root command and its whole subtree.
@@ -100,6 +101,7 @@ Quick start:
 	pf.StringVar(&g.token, "token", "", "official Graph API token (or THREADS_TOKEN)")
 	pf.StringVar(&g.session, "session", "", "logged-in session id (or THREADS_SESSION)")
 	pf.StringVar(&g.csrf, "csrf", "", "session CSRF token (or THREADS_CSRF)")
+	pf.StringVar(&g.captureFile, "capture-file", "", "captured GraphQL request JSON for full-history pagination (or THREADS_CAPTURE_FILE)")
 
 	root.AddCommand(
 		newProfileCmd(app),
@@ -138,6 +140,9 @@ func (a *App) init(g *globalFlags) error {
 	}
 	if g.csrf != "" {
 		cfg.CSRF = g.csrf
+	}
+	if g.captureFile != "" {
+		cfg.CaptureFile = g.captureFile
 	}
 
 	client, err := threads.NewClient(cfg)
